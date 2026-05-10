@@ -1,4 +1,0 @@
-pyrofork
-tgcrypto
-aiosqlite
-python-dotenv
