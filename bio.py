@@ -12,7 +12,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, Message
 )
 
-from config import API_ID, API_HASH, BOT_TOKEN, URL_PATTERN, BAN_DURATION_DAYS
+from config import API_ID, API_HASH, BOT_TOKEN, URL_PATTERN
 from utils import (
     init_db, start_cleanup_scheduler, is_admin,
     is_whitelisted, add_whitelist, remove_whitelist, get_whitelist,
@@ -84,6 +84,18 @@ async def ban_user_safe(client: Client, chat_id: int, user_id: int, days: int):
         pass
     except Exception:
         pass
+
+
+async def get_user_bio(client: Client, user_id: int) -> str:
+    """
+    FIX: get_chat() on a user ID does NOT return bio reliably.
+    Must use get_users() to fetch the UserFull object which contains bio.
+    """
+    try:
+        user = await client.get_users(user_id)
+        return user.bio or ""
+    except Exception:
+        return ""
 
 
 # ── Warning Messages ───────────────────────────────────────────────────────────
@@ -415,7 +427,7 @@ async def cmd_linklist(client: Client, message: Message):
     links = await get_allowed_links()
     if not links:
         return await message.reply_text("📋 **No ignored links yet.**")
-    text = "📋 **Ignored Links:**\n\n" + "\n".join(f"{i}. `{l}`" for i, l in enumerate(links, 1))
+    text = "📋 **Ignored Links:**\n\n" + "\n".join(f"{i}. `{lnk}`" for i, lnk in enumerate(links, 1))
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close")]])
     await message.reply_text(text, reply_markup=kb)
 
@@ -517,7 +529,7 @@ async def callback_handler(client, callback_query):
 
 async def handle_violation(client: Client, message: Message, user, chat_id: int, settings: dict, strike: int):
     """Handle a bio violation based on the current strike count."""
-    ban_days  = settings["ban_days"]
+    ban_days   = settings["ban_days"]
     KICK_LIMIT = 3
 
     if strike < KICK_LIMIT:
@@ -533,27 +545,25 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
         await asyncio.sleep(wait_mins * 60)
 
         # Check if the user removed the link during the grace period
-        try:
-            refreshed = await client.get_chat(user.id)
-            bio = refreshed.bio or ""
-            found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
-            all_ok = True
-            for url in found:
-                if not await is_link_allowed(url):
-                    all_ok = False
-                    break
-            if all_ok:
-                if warn_msg:
-                    try: await warn_msg.delete()
-                    except Exception: pass
-                return
-        except Exception:
-            pass
+        # FIX: use get_users() instead of get_chat() to reliably fetch bio
+        bio = await get_user_bio(client, user.id)
+        found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
+        all_ok = all(await is_link_allowed(url) for url in found) if found else True
+
+        if all_ok:
+            if warn_msg:
+                try:
+                    await warn_msg.delete()
+                except Exception:
+                    pass
+            return
 
         # Link still present — delete warning, delete user messages, kick
         if warn_msg:
-            try: await warn_msg.delete()
-            except Exception: pass
+            try:
+                await warn_msg.delete()
+            except Exception:
+                pass
         await delete_message_safe(message)
         await delete_user_messages(client, chat_id, user.id)
         await kick_user_safe(client, chat_id, user.id)
@@ -561,7 +571,7 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
             await send_pm_kick_notice(client, user, message.chat.title)
 
     else:
-        # ── Strike 3: final warning → 5 min grace → ban ──
+        # ── Strike 3+: final warning → 5 min grace → ban ──
         wait_mins = 5
         warn_msg  = None
 
@@ -573,28 +583,26 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
         await asyncio.sleep(wait_mins * 60)
 
         # Check if the user removed the link
-        try:
-            refreshed = await client.get_chat(user.id)
-            bio = refreshed.bio or ""
-            found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
-            all_ok = True
-            for url in found:
-                if not await is_link_allowed(url):
-                    all_ok = False
-                    break
-            if all_ok:
-                await reset_kicks(chat_id, user.id)
-                if warn_msg:
-                    try: await warn_msg.delete()
-                    except Exception: pass
-                return
-        except Exception:
-            pass
+        # FIX: use get_users() instead of get_chat() to reliably fetch bio
+        bio = await get_user_bio(client, user.id)
+        found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
+        all_ok = all(await is_link_allowed(url) for url in found) if found else True
+
+        if all_ok:
+            await reset_kicks(chat_id, user.id)
+            if warn_msg:
+                try:
+                    await warn_msg.delete()
+                except Exception:
+                    pass
+            return
 
         # Link still present — delete warning, delete user messages, ban
         if warn_msg:
-            try: await warn_msg.delete()
-            except Exception: pass
+            try:
+                await warn_msg.delete()
+            except Exception:
+                pass
         await delete_message_safe(message)
         await delete_user_messages(client, chat_id, user.id)
         await ban_user_safe(client, chat_id, user.id, ban_days)
@@ -632,27 +640,22 @@ async def check_bio(client: Client, message: Message):
         if await is_whitelisted(chat_id, user_id):
             return
 
-        try:
-            user_full = await client.get_chat(user_id)
-            bio = user_full.bio or ""
-        except Exception:
+        # FIX: use get_users() to reliably fetch bio
+        bio = await get_user_bio(client, user_id)
+        if not bio:
             return
 
         found_urls = [m.group(0) for m in URL_PATTERN.finditer(bio)]
         if not found_urls:
             return
 
-        all_allowed = True
-        for url in found_urls:
-            if not await is_link_allowed(url):
-                all_allowed = False
-                break
+        all_allowed = all(await is_link_allowed(url) for url in found_urls)
         if all_allowed:
             return
 
-        settings   = await get_chat_settings(chat_id)
-        strike     = await increment_kick(chat_id, user_id)
-        user       = message.from_user
+        settings = await get_chat_settings(chat_id)
+        strike   = await increment_kick(chat_id, user_id)
+        user     = message.from_user
 
         await handle_violation(client, message, user, chat_id, settings, strike)
 
@@ -664,10 +667,12 @@ async def check_bio(client: Client, message: Message):
 
 async def main():
     await init_db()
-    asyncio.create_task(start_cleanup_scheduler())
+    # FIX: start the bot first, THEN create tasks that need a running event loop
     await app.start()
+    asyncio.create_task(start_cleanup_scheduler())
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    app.run(main())
+    # FIX: use asyncio.run() instead of app.run() for proper async lifecycle
+    asyncio.run(main())
