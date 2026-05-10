@@ -49,6 +49,21 @@ async def delete_message_safe(message: Message):
         pass
 
 
+async def delete_user_messages(client: Client, chat_id: int, user_id: int):
+    try:
+        await client.delete_user_history(chat_id, user_id)
+    except Exception:
+        pass
+
+
+async def _delete_after(msg, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
 async def kick_user_safe(client: Client, chat_id: int, user_id: int):
     try:
         await client.ban_chat_member(chat_id, user_id)
@@ -88,7 +103,8 @@ async def send_group_warn_strike(message: Message, user, strike: int, limit: int
         f"🛡️ Powered by **Anti Bio Link**"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    return sent
 
 
 async def send_group_final_warning(message: Message, user, wait_mins: int):
@@ -105,7 +121,8 @@ async def send_group_final_warning(message: Message, user, wait_mins: int):
         f"🛡️ Powered by **Anti Bio Link**"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    return sent
 
 
 async def send_group_ban_notice(message: Message, user, ban_days: int):
@@ -121,7 +138,8 @@ async def send_group_ban_notice(message: Message, user, ban_days: int):
         f"🛡️ This group is protected by **Anti Bio Link**"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+    return sent
 
 
 async def send_pm_warn_strike(client: Client, user, chat_title: str, strike: int, limit: int, wait_mins: int):
@@ -505,9 +523,10 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
     if strike < KICK_LIMIT:
         # ── Strike 1 or 2: warn → 3 min grace → kick ──
         wait_mins = 3
+        warn_msg  = None
 
         if settings["warn_in_group"]:
-            await send_group_warn_strike(message, user, strike, KICK_LIMIT, wait_mins)
+            warn_msg = await send_group_warn_strike(message, user, strike, KICK_LIMIT, wait_mins)
         if settings["warn_in_pm"]:
             await send_pm_warn_strike(client, user, message.chat.title, strike, KICK_LIMIT, wait_mins)
 
@@ -524,13 +543,19 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
                     all_ok = False
                     break
             if all_ok:
-                # User removed the link — no action needed
+                if warn_msg:
+                    try: await warn_msg.delete()
+                    except Exception: pass
                 return
         except Exception:
             pass
 
-        # Link still present — kick
+        # Link still present — delete warning, delete user messages, kick
+        if warn_msg:
+            try: await warn_msg.delete()
+            except Exception: pass
         await delete_message_safe(message)
+        await delete_user_messages(client, chat_id, user.id)
         await kick_user_safe(client, chat_id, user.id)
         if settings["warn_in_pm"]:
             await send_pm_kick_notice(client, user, message.chat.title)
@@ -538,9 +563,10 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
     else:
         # ── Strike 3: final warning → 5 min grace → ban ──
         wait_mins = 5
+        warn_msg  = None
 
         if settings["warn_in_group"]:
-            await send_group_final_warning(message, user, wait_mins)
+            warn_msg = await send_group_final_warning(message, user, wait_mins)
         if settings["warn_in_pm"]:
             await send_pm_final_warning(client, user, message.chat.title, wait_mins)
 
@@ -558,15 +584,24 @@ async def handle_violation(client: Client, message: Message, user, chat_id: int,
                     break
             if all_ok:
                 await reset_kicks(chat_id, user.id)
+                if warn_msg:
+                    try: await warn_msg.delete()
+                    except Exception: pass
                 return
         except Exception:
             pass
 
-        # Link still present — ban
+        # Link still present — delete warning, delete user messages, ban
+        if warn_msg:
+            try: await warn_msg.delete()
+            except Exception: pass
         await delete_message_safe(message)
+        await delete_user_messages(client, chat_id, user.id)
         await ban_user_safe(client, chat_id, user.id, ban_days)
         if settings["warn_in_group"]:
-            await send_group_ban_notice(message, user, ban_days)
+            ban_notice = await send_group_ban_notice(message, user, ban_days)
+            if ban_notice:
+                asyncio.create_task(_delete_after(ban_notice, 180))
         if settings["warn_in_pm"]:
             await send_pm_ban_notice(client, user, message.chat.title, ban_days)
 
