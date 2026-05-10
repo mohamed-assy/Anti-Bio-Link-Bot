@@ -183,20 +183,16 @@ async def is_link_allowed(url: str) -> bool:
 
 async def cleanup_database():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Remove expired bans
         c = await db.execute("DELETE FROM bans WHERE unban_at < datetime('now')")
         d_bans = c.rowcount
-
-        # Remove kick records older than 30 days
         c = await db.execute("DELETE FROM kicks WHERE updated_at < datetime('now', '-30 days')")
         d_kicks = c.rowcount
-
-        # FIX: Do NOT auto-delete whitelists by date — admins whitelist users intentionally.
-        # Whitelist entries should only be removed via /unfree or the remove button.
-
+        cutoff = (datetime.utcnow() - timedelta(days=INACTIVE_CHAT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        c = await db.execute("DELETE FROM whitelists WHERE added_at < ?", (cutoff,))
+        d_wl = c.rowcount
         await db.execute("VACUUM")
         await db.commit()
-    logger.info(f"🧹 Cleanup: {d_bans} expired bans | {d_kicks} old kick records removed.")
+    logger.info(f"🧹 Cleanup: {d_bans} expired bans | {d_kicks} old kicks | {d_wl} old whitelist entries removed.")
 
 async def start_cleanup_scheduler():
     while True:
