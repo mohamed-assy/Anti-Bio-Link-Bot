@@ -1,6 +1,6 @@
 """
 🛡️ Anti Bio Link Bot
-Group: https://t.me/english_world_chatting
+Support: https://t.me/english_world_chatting
 """
 
 import asyncio
@@ -8,331 +8,226 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from pyrogram import Client, filters, errors
-from pyrogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, Message
-)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
-from config import API_ID, API_HASH, BOT_TOKEN, URL_PATTERN, BAN_DURATION_DAYS
+from config import API_ID, API_HASH, BOT_TOKEN, URL_PATTERN
 from utils import (
     init_db, start_cleanup_scheduler, is_admin,
     is_whitelisted, add_whitelist, remove_whitelist, get_whitelist,
     log_ban, remove_ban,
-    increment_kick, reset_kicks, get_kick_count,
+    increment_kick, reset_kicks,
     add_allowed_link, remove_allowed_link, get_allowed_links, is_link_allowed,
     get_chat_settings, update_chat_settings,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-app = Client(
-    "anti_bio_link",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
+app = Client("anti_bio_link", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+KICK_LIMIT  = 3
+GRACE_KICK  = 3   # minutes before kick
+GRACE_BAN   = 5   # minutes before ban
+BAN_NOTICE_TTL = 180  # seconds before ban notice is deleted
 
-def strike_badge(count: int, limit: int) -> str:
+# Sets for tracking
+_processing: set = set()
+_in_grace:   set = set()
+
+# ── Utility ────────────────────────────────────────────────────────────────────
+
+def badge(count: int, limit: int) -> str:
     return "🔴" * count + "⚪️" * (limit - count)
 
+def close_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Dismiss", callback_data="close")]])
 
-async def delete_message_safe(message: Message):
-    try:
-        await message.delete()
-    except errors.MessageDeleteForbidden:
-        pass
-    except Exception:
-        pass
-
-
-async def delete_user_messages(client: Client, chat_id: int, user_id: int):
-    try:
-        await client.delete_user_history(chat_id, user_id)
-    except Exception:
-        pass
-
-
-async def _delete_after(msg, delay: int):
-    await asyncio.sleep(delay)
+async def safe_delete(msg) -> None:
+    if msg is None:
+        return
     try:
         await msg.delete()
     except Exception:
         pass
 
+async def delete_after(msg, delay: int) -> None:
+    await asyncio.sleep(delay)
+    await safe_delete(msg)
 
-async def kick_user_safe(client: Client, chat_id: int, user_id: int):
+async def delete_user_history(client: Client, chat_id: int, user_id: int) -> None:
+    try:
+        await client.delete_user_history(chat_id, user_id)
+    except Exception:
+        pass
+
+async def kick_user(client: Client, chat_id: int, user_id: int) -> None:
     try:
         await client.ban_chat_member(chat_id, user_id)
         await client.unban_chat_member(chat_id, user_id)
-    except errors.ChatAdminRequired:
-        pass
     except Exception:
         pass
 
-
-async def mute_user(client: Client, chat_id: int, user_id: int):
+async def ban_user(client: Client, chat_id: int, user_id: int, days: int) -> None:
     try:
-        await client.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-            )
-        )
-    except Exception:
-        pass
-
-
-async def unmute_user(client: Client, chat_id: int, user_id: int):
-    try:
-        await client.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            )
-        )
-    except Exception:
-        pass
-
-
-async def ban_user_safe(client: Client, chat_id: int, user_id: int, days: int):
-    try:
-        until_date = datetime.now(timezone.utc) + timedelta(days=days)
-        await client.ban_chat_member(chat_id, user_id, until_date=until_date)
+        until = datetime.now(timezone.utc) + timedelta(days=days)
+        await client.ban_chat_member(chat_id, user_id, until_date=until)
         await log_ban(chat_id, user_id, days)
         await reset_kicks(chat_id, user_id)
-    except errors.ChatAdminRequired:
-        pass
     except Exception:
         pass
 
+async def bio_has_violation(client: Client, user_id: int) -> bool:
+    try:
+        chat = await client.get_chat(user_id)
+        bio  = chat.bio or ""
+        for m in URL_PATTERN.finditer(bio):
+            if not await is_link_allowed(m.group(0)):
+                return True
+        return False
+    except Exception:
+        return True
 
-# ── Warning Messages ───────────────────────────────────────────────────────────
+async def resolve_user(client: Client, message: Message):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+    if len(message.command) > 1:
+        arg = message.command[1].lstrip("@")
+        try:
+            return await client.get_users(int(arg) if arg.isdigit() else arg)
+        except Exception:
+            await message.reply_text("❌ **User not found.**")
+            return None
+    await message.reply_text("ℹ️ **Reply to a user or provide a username / ID.**")
+    return None
 
-async def send_group_warn_strike(message: Message, user, strike: int, limit: int, wait_mins: int):
+# ── Messages ───────────────────────────────────────────────────────────────────
+
+async def msg_strike_warning(message: Message, user, strike: int, wait: int):
     mention = f"[{user.first_name}](tg://user?id={user.id})"
-    badge   = strike_badge(strike, limit)
-
     text = (
-        f"⚠️ **Warning — Promotional Bio Detected**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"👤 **User:** {mention}\n"
-        f"📌 **Reason:** Bio contains a Telegram promotion link\n"
-        f"📊 **Strikes:** {badge}  `{strike} / {limit}`\n"
-        f"⏱️ **Action in:** {wait_mins} minute(s) — remove the link to avoid it\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🛡️ Powered by **Anti Bio Link**"
+        f"⚠️ **Bio Violation Detected**\n"
+        f"{'─' * 22}\n"
+        f"👤 **User ›** {mention}\n"
+        f"📌 **Reason ›** Telegram promotion link in bio\n"
+        f"📊 **Strike ›** {badge(strike, KICK_LIMIT)}  {strike}/{KICK_LIMIT}\n"
+        f"⏳ **Grace period ›** {wait} min — remove the link to avoid action\n"
+        f"{'─' * 22}\n"
+        f"🛡️ **Anti Bio Link** is watching."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
-    return sent
+    return await message.reply_text(text, reply_markup=close_kb(), disable_web_page_preview=True)
 
-
-async def send_group_final_warning(message: Message, user, wait_mins: int):
+async def msg_final_warning(message: Message, user, wait: int, ban_days: int):
     mention = f"[{user.first_name}](tg://user?id={user.id})"
-
     text = (
-        f"🚨 **Final Warning**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"👤 **User:** {mention}\n"
-        f"📌 **Reason:** Bio contains a Telegram promotion link\n"
-        f"⏱️ **You have {wait_mins} minute(s)** to remove the link from your bio\n"
-        f"🔨 **Failure to do so will result in a 30-day ban**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🛡️ Powered by **Anti Bio Link**"
+        f"🚨 **Final Warning — Last Chance**\n"
+        f"{'─' * 22}\n"
+        f"👤 **User ›** {mention}\n"
+        f"📌 **Reason ›** Telegram promotion link in bio\n"
+        f"📊 **Strike ›** {badge(KICK_LIMIT, KICK_LIMIT)}  {KICK_LIMIT}/{KICK_LIMIT}\n"
+        f"⏳ **Grace period ›** {wait} min — remove the link **now**\n"
+        f"🔨 **Consequence ›** {ban_days}-day ban if link remains\n"
+        f"{'─' * 22}\n"
+        f"🛡️ **Anti Bio Link** — This is your final warning."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
-    return sent
+    return await message.reply_text(text, reply_markup=close_kb(), disable_web_page_preview=True)
 
-
-async def send_group_ban_notice(message: Message, user, ban_days: int):
+async def msg_ban_notice(message: Message, user, ban_days: int):
     mention = f"[{user.first_name}](tg://user?id={user.id})"
-
     text = (
         f"🚫 **User Banned**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"👤 **User:** {mention}\n"
-        f"📌 **Reason:** Repeated promotion via bio\n"
-        f"⏳ **Duration:** {ban_days} day(s)\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🛡️ This group is protected by **Anti Bio Link**"
+        f"{'─' * 22}\n"
+        f"👤 **User ›** {mention}\n"
+        f"📌 **Reason ›** Repeated bio promotion after warnings\n"
+        f"⏳ **Duration ›** {ban_days} day(s)\n"
+        f"{'─' * 22}\n"
+        f"🛡️ This group is protected by **Anti Bio Link**."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Dismiss", callback_data="close")]])
-    sent = await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
-    return sent
-
-
-async def send_pm_warn_strike(client: Client, user, chat_title: str, strike: int, limit: int, wait_mins: int):
-    badge = strike_badge(strike, limit)
-    text = (
-        f"⚠️ **Warning — {chat_title}**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📌 **Reason:** Your bio contains a Telegram promotion link\n"
-        f"📊 **Strikes:** {badge}  `{strike} / {limit}`\n"
-        f"⏱️ **You have {wait_mins} minute(s)** to remove the link from your bio\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"✅ Remove the link now to avoid being kicked."
-    )
-    try:
-        await client.send_message(user.id, text)
-    except Exception:
-        pass
-
-
-async def send_pm_kick_notice(client: Client, user, chat_title: str):
-    text = (
-        f"👢 **You have been removed from {chat_title}**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📌 **Reason:** Your bio still contained a Telegram promotion link\n\n"
-        f"✅ Remove the link from your bio before rejoining.\n"
-        f"⚠️ Further violations will result in a permanent ban."
-    )
-    try:
-        await client.send_message(user.id, text)
-    except Exception:
-        pass
-
-
-async def send_pm_final_warning(client: Client, user, chat_title: str, wait_mins: int):
-    text = (
-        f"🚨 **Final Warning — {chat_title}**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📌 **Reason:** Your bio contains a Telegram promotion link\n"
-        f"⏱️ **You have {wait_mins} minute(s)** to remove it\n"
-        f"🔨 **If not removed, you will be banned for 30 days**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"This is your last chance. Act now."
-    )
-    try:
-        await client.send_message(user.id, text)
-    except Exception:
-        pass
-
-
-async def send_pm_ban_notice(client: Client, user, chat_title: str, ban_days: int):
-    text = (
-        f"🚫 **You have been banned from {chat_title}**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📌 **Reason:** Repeated promotion via bio\n"
-        f"⏳ **Duration:** {ban_days} day(s)\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"To appeal, contact the group admins."
-    )
-    try:
-        await client.send_message(user.id, text)
-    except Exception:
-        pass
-
+    return await message.reply_text(text, reply_markup=close_kb(), disable_web_page_preview=True)
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
+async def cmd_start(client: Client, message: Message):
     bot  = await client.get_me()
     text = (
         f"🛡️ **Anti Bio Link**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n\n"
-        f"I keep your group safe by detecting and removing users\n"
-        f"who advertise Telegram channels or groups via their bio.\n\n"
-        f"**⚙️ How it works:**\n"
-        f"› Scans user bios for Telegram promotion links\n"
-        f"› Warns the user and gives them time to fix their bio\n"
-        f"› Kicks on strike 1 & 2 after the grace period\n"
-        f"› Bans for 30 days on the 3rd strike\n\n"
-        f"Type /help to see all available commands."
+        f"{'─' * 22}\n\n"
+        f"Automatically protects your group from users who\n"
+        f"promote Telegram channels or groups via their bio.\n\n"
+        f"**⚙️ How it works**\n"
+        f"› Detects Telegram links in user bios\n"
+        f"› Deletes messages instantly on detection\n"
+        f"› Issues a warning with a grace period\n"
+        f"› Any message during grace period is deleted\n"
+        f"› Strike 1 & 2 → Kick after grace period\n"
+        f"› Strike 3 → Ban after grace period\n\n"
+        f"Use /help to see all commands."
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot.username}?startgroup=true")],
         [
             InlineKeyboardButton("💬 Support", url="https://t.me/english_world_chatting"),
-            InlineKeyboardButton("❌ Close", callback_data="close"),
-        ]
+            InlineKeyboardButton("✖️ Close", callback_data="close"),
+        ],
     ])
     await message.reply_text(text, reply_markup=kb)
-
 
 # ── /help ──────────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("help"))
-async def help_handler(client: Client, message: Message):
+async def cmd_help(client: Client, message: Message):
     text = (
-        f"🛡️ **Anti Bio Link — Commands**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n\n"
-        f"**👮 Admin Commands:**\n"
-        f"› `/settings` — view & adjust bot settings\n"
-        f"› `/free` — exempt a user from scanning\n"
-        f"› `/unfree` — remove exemption\n"
-        f"› `/freelist` — list exempted users\n"
-        f"› `/addlink` — whitelist a specific link\n"
-        f"› `/removelink` — remove a whitelisted link\n"
-        f"› `/linklist` — view all whitelisted links\n"
+        f"🛡️ **Anti Bio Link — Help**\n"
+        f"{'─' * 22}\n\n"
+        f"**👮 Admin Commands**\n"
+        f"› `/settings` — configure bot for this group\n"
+        f"› `/free` — whitelist a user (reply or @user)\n"
+        f"› `/unfree` — remove from whitelist\n"
+        f"› `/freelist` — view whitelisted users\n"
+        f"› `/addlink <url>` — ignore a specific link\n"
+        f"› `/removelink <url>` — remove ignored link\n"
+        f"› `/linklist` — view all ignored links\n"
         f"› `/unban` — unban a user in this group\n\n"
-        f"**⚙️ Configurable per group:**\n"
-        f"› Ban duration (days)\n"
-        f"› Group warning on/off\n"
-        f"› Private message warning on/off\n\n"
-        f"**🤖 Auto protection flow:**\n"
-        f"› **Strike 1 & 2:** Warning → 3 min grace → Kick\n"
-        f"› **Strike 3:** Final warning → 5 min grace → Ban (30 days)"
+        f"**🤖 Auto Protection Flow**\n"
+        f"› Message deleted instantly on detection\n"
+        f"› Warning issued with grace period\n"
+        f"› Any new message during grace → deleted\n"
+        f"› Strike 1 & 2 → {GRACE_KICK} min grace → **Kick**\n"
+        f"› Strike 3 → {GRACE_BAN} min grace → **Ban**\n"
+        f"› Link removed during grace → no action taken"
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb)
-
+    await message.reply_text(text, reply_markup=close_kb())
 
 # ── /settings ──────────────────────────────────────────────────────────────────
 
-def settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
-    group_btn = f"{'✅' if settings['warn_in_group'] else '❌'} Group Warn"
-    pm_btn    = f"{'✅' if settings['warn_in_pm']    else '❌'} PM Warn"
-
+def build_settings_kb(s: dict) -> InlineKeyboardMarkup:
+    gw = "✅ Group Warn ON" if s["warn_in_group"] else "❌ Group Warn OFF"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⏳ Ban duration: {settings['ban_days']} day(s)", callback_data="noop")],
+        [InlineKeyboardButton(f"⏳ Ban Duration: {s['ban_days']} day(s)", callback_data="noop")],
         [
-            InlineKeyboardButton("➖", callback_data="ban_days_dec"),
-            InlineKeyboardButton("➕", callback_data="ban_days_inc"),
+            InlineKeyboardButton("➖ 5", callback_data="ban_days_dec"),
+            InlineKeyboardButton("➕ 5", callback_data="ban_days_inc"),
         ],
-        [
-            InlineKeyboardButton(group_btn, callback_data="toggle_group_warn"),
-            InlineKeyboardButton(pm_btn,    callback_data="toggle_pm_warn"),
-        ],
-        [InlineKeyboardButton("❌ Close", callback_data="close")],
+        [InlineKeyboardButton(gw, callback_data="toggle_group_warn")],
+        [InlineKeyboardButton("✖️ Close", callback_data="close")],
     ])
 
-
-def settings_text(settings: dict, chat_title: str) -> str:
+def build_settings_text(s: dict, title: str) -> str:
     return (
-        f"⚙️ **Bot Settings**\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"📍 **Group:** {chat_title}\n\n"
-        f"⏳ **Ban duration:** `{settings['ban_days']} day(s)`\n"
-        f"📢 **Group warning:** {'Enabled ✅' if settings['warn_in_group'] else 'Disabled ❌'}\n"
-        f"📩 **PM warning:** {'Enabled ✅' if settings['warn_in_pm'] else 'Disabled ❌'}\n\n"
-        f"**Strike system (fixed):**\n"
-        f"› Strike 1 & 2 → Warning + 3 min grace → Kick\n"
-        f"› Strike 3 → Final warning + 5 min grace → Ban"
+        f"⚙️ **Settings — {title}**\n"
+        f"{'─' * 22}\n\n"
+        f"⏳ **Ban duration ›** `{s['ban_days']} day(s)`\n"
+        f"📢 **Group warning ›** {'Enabled ✅' if s['warn_in_group'] else 'Disabled ❌'}\n\n"
+        f"**Strike flow (fixed)**\n"
+        f"› Strike 1 & 2 → {GRACE_KICK} min grace → Kick\n"
+        f"› Strike 3 → {GRACE_BAN} min grace → Ban"
     )
-
 
 @app.on_message(filters.group & filters.command("settings"))
-async def settings_handler(client: Client, message: Message):
+async def cmd_settings(client: Client, message: Message):
     if not await is_admin(client, message.chat.id, message.from_user.id):
         return
-    settings = await get_chat_settings(message.chat.id)
-    await message.reply_text(
-        settings_text(settings, message.chat.title),
-        reply_markup=settings_keyboard(settings)
-    )
-
+    s = await get_chat_settings(message.chat.id)
+    await message.reply_text(build_settings_text(s, message.chat.title), reply_markup=build_settings_kb(s))
 
 # ── /free /unfree /freelist ────────────────────────────────────────────────────
 
@@ -340,58 +235,36 @@ async def settings_handler(client: Client, message: Message):
 async def cmd_free(client: Client, message: Message):
     if not await is_admin(client, message.chat.id, message.from_user.id):
         return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    elif len(message.command) > 1:
-        arg = message.command[1].lstrip("@")
-        try:
-            target = await client.get_users(int(arg) if arg.isdigit() else arg)
-        except Exception:
-            return await message.reply_text("❌ **User not found.**")
-    else:
-        return await message.reply_text("**Usage:** `/free @username` or reply to a user.")
-
+    target = await resolve_user(client, message)
+    if not target:
+        return
     await add_whitelist(message.chat.id, target.id)
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚫 Remove", callback_data=f"unwhitelist_{target.id}"),
-        InlineKeyboardButton("❌ Close",  callback_data="close"),
+        InlineKeyboardButton("🚫 Remove", callback_data=f"unwl_{target.id}"),
+        InlineKeyboardButton("✖️ Close",  callback_data="close"),
     ]])
     await message.reply_text(
-        f"✅ **{target.mention} has been whitelisted.**\n"
-        f"The bot will ignore this user's bio.",
+        f"✅ **{target.mention} is now whitelisted.**\n"
+        f"Their bio will no longer be scanned.",
         reply_markup=kb
     )
-
 
 @app.on_message(filters.group & filters.command("unfree"))
 async def cmd_unfree(client: Client, message: Message):
     if not await is_admin(client, message.chat.id, message.from_user.id):
         return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    elif len(message.command) > 1:
-        arg = message.command[1].lstrip("@")
-        try:
-            target = await client.get_users(int(arg) if arg.isdigit() else arg)
-        except Exception:
-            return await message.reply_text("❌ **User not found.**")
-    else:
-        return await message.reply_text("**Usage:** `/unfree @username` or reply to a user.")
-
+    target = await resolve_user(client, message)
+    if not target:
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Re-add", callback_data=f"wl_{target.id}"),
+        InlineKeyboardButton("✖️ Close",  callback_data="close"),
+    ]])
     if await is_whitelisted(message.chat.id, target.id):
         await remove_whitelist(message.chat.id, target.id)
-        text = f"🚫 **{target.mention} removed from whitelist.**"
+        await message.reply_text(f"🚫 **{target.mention} removed from whitelist.**", reply_markup=kb)
     else:
-        text = f"ℹ️ **{target.mention} is not whitelisted.**"
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Re-add", callback_data=f"whitelist_{target.id}"),
-        InlineKeyboardButton("❌ Close",  callback_data="close"),
-    ]])
-    await message.reply_text(text, reply_markup=kb)
-
+        await message.reply_text(f"ℹ️ **{target.mention} is not whitelisted.**", reply_markup=kb)
 
 @app.on_message(filters.group & filters.command("freelist"))
 async def cmd_freelist(client: Client, message: Message):
@@ -399,17 +272,16 @@ async def cmd_freelist(client: Client, message: Message):
         return
     ids = await get_whitelist(message.chat.id)
     if not ids:
-        return await message.reply_text("📋 **No whitelisted users in this group.**")
-    text = "📋 **Whitelisted Users:**\n\n"
+        return await message.reply_text("📋 **Whitelist is empty.**")
+    lines = []
     for i, uid in enumerate(ids, 1):
         try:
             u = await client.get_users(uid)
-            text += f"{i}. {u.mention} `{uid}`\n"
+            lines.append(f"{i}. {u.mention} — `{uid}`")
         except Exception:
-            text += f"{i}. [Unknown] `{uid}`\n"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb)
-
+            lines.append(f"{i}. [Unknown] — `{uid}`")
+    text = f"📋 **Whitelisted Users**\n{'─' * 22}\n\n" + "\n".join(lines)
+    await message.reply_text(text, reply_markup=close_kb())
 
 # ── /addlink /removelink /linklist ─────────────────────────────────────────────
 
@@ -421,8 +293,7 @@ async def cmd_addlink(client: Client, message: Message):
         return await message.reply_text("**Usage:** `/addlink t.me/example`")
     link = message.command[1].strip().lower().rstrip("/")
     await add_allowed_link(link)
-    await message.reply_text(f"✅ **`{link}` added to ignored links.**")
-
+    await message.reply_text(f"✅ **`{link}` added to ignored links.**\nBios containing this link will be ignored.")
 
 @app.on_message(filters.group & filters.command("removelink"))
 async def cmd_removelink(client: Client, message: Message):
@@ -431,12 +302,10 @@ async def cmd_removelink(client: Client, message: Message):
     if len(message.command) < 2:
         return await message.reply_text("**Usage:** `/removelink t.me/example`")
     link = message.command[1].strip().lower().rstrip("/")
-    removed = await remove_allowed_link(link)
-    if removed:
+    if await remove_allowed_link(link):
         await message.reply_text(f"🗑️ **`{link}` removed from ignored links.**")
     else:
-        await message.reply_text(f"⚠️ **`{link}` not found in the list.**")
-
+        await message.reply_text(f"⚠️ **`{link}` was not found in the list.**")
 
 @app.on_message(filters.group & filters.command("linklist"))
 async def cmd_linklist(client: Client, message: Message):
@@ -445,10 +314,8 @@ async def cmd_linklist(client: Client, message: Message):
     links = await get_allowed_links()
     if not links:
         return await message.reply_text("📋 **No ignored links yet.**")
-    text = "📋 **Ignored Links:**\n\n" + "\n".join(f"{i}. `{l}`" for i, l in enumerate(links, 1))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close")]])
-    await message.reply_text(text, reply_markup=kb)
-
+    text = f"📋 **Ignored Links**\n{'─' * 22}\n\n" + "\n".join(f"{i}. `{l}`" for i, l in enumerate(links, 1))
+    await message.reply_text(text, reply_markup=close_kb())
 
 # ── /unban ─────────────────────────────────────────────────────────────────────
 
@@ -456,210 +323,136 @@ async def cmd_linklist(client: Client, message: Message):
 async def cmd_unban(client: Client, message: Message):
     if not await is_admin(client, message.chat.id, message.from_user.id):
         return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    elif len(message.command) > 1:
-        arg = message.command[1].lstrip("@")
-        try:
-            target = await client.get_users(int(arg) if arg.isdigit() else arg)
-        except Exception:
-            return await message.reply_text("❌ **User not found.**")
-    else:
-        return await message.reply_text("**Usage:** `/unban @username` or reply to a user.")
-
+    target = await resolve_user(client, message)
+    if not target:
+        return
     try:
         await client.unban_chat_member(message.chat.id, target.id)
         await remove_ban(message.chat.id, target.id)
         await reset_kicks(message.chat.id, target.id)
         await message.reply_text(f"✅ **{target.mention} has been unbanned.**")
     except Exception as e:
-        await message.reply_text(f"❌ **Failed to unban:** `{e}`")
-
+        await message.reply_text(f"❌ **Failed:** `{e}`")
 
 # ── Callbacks ──────────────────────────────────────────────────────────────────
 
 @app.on_callback_query()
-async def callback_handler(client, callback_query):
-    data    = callback_query.data
-    chat_id = callback_query.message.chat.id
-    user_id = callback_query.from_user.id
+async def callback_handler(client, cq):
+    data    = cq.data
+    chat_id = cq.message.chat.id
+    user_id = cq.from_user.id
 
     if data == "close":
-        return await callback_query.message.delete()
-
+        return await cq.message.delete()
     if data == "noop":
-        return await callback_query.answer()
+        return await cq.answer()
 
     if not await is_admin(client, chat_id, user_id):
-        return await callback_query.answer("❌ Admins only.", show_alert=True)
+        return await cq.answer("❌ Admins only.", show_alert=True)
 
-    settings_actions = {
+    actions = {
         "toggle_group_warn": ("warn_in_group", None),
-        "toggle_pm_warn":    ("warn_in_pm",    None),
-        "ban_days_inc":      ("ban_days",       5),
-        "ban_days_dec":      ("ban_days",      -5),
+        "ban_days_inc":      ("ban_days",  5),
+        "ban_days_dec":      ("ban_days", -5),
     }
 
-    if data in settings_actions:
-        settings = await get_chat_settings(chat_id)
-        key, delta = settings_actions[data]
-        if delta is None:
-            settings[key] = not settings[key]
-        else:
-            settings[key] = max(1, settings[key] + delta)
-        await update_chat_settings(chat_id, **settings)
-        settings = await get_chat_settings(chat_id)
-        await callback_query.message.edit_text(
-            settings_text(settings, callback_query.message.chat.title),
-            reply_markup=settings_keyboard(settings)
-        )
-        return await callback_query.answer("✅ Updated!")
+    if data in actions:
+        s = await get_chat_settings(chat_id)
+        key, delta = actions[data]
+        s[key] = not s[key] if delta is None else max(1, s[key] + delta)
+        await update_chat_settings(chat_id, **s)
+        s = await get_chat_settings(chat_id)
+        await cq.message.edit_text(build_settings_text(s, cq.message.chat.title), reply_markup=build_settings_kb(s))
+        return await cq.answer("✅ Saved!")
 
-    if data.startswith("whitelist_"):
-        target_id = int(data.split("_")[1])
-        await add_whitelist(chat_id, target_id)
-        user = await client.get_users(target_id)
+    if data.startswith("wl_"):
+        tid = int(data.split("_")[1])
+        await add_whitelist(chat_id, tid)
+        u = await client.get_users(tid)
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🚫 Remove", callback_data=f"unwhitelist_{target_id}"),
-            InlineKeyboardButton("❌ Close",  callback_data="close"),
+            InlineKeyboardButton("🚫 Remove", callback_data=f"unwl_{tid}"),
+            InlineKeyboardButton("✖️ Close",  callback_data="close"),
         ]])
-        await callback_query.message.edit_text(
-            f"✅ **{user.mention} has been whitelisted.**", reply_markup=kb
-        )
-        return await callback_query.answer()
+        await cq.message.edit_text(f"✅ **{u.mention} is now whitelisted.**", reply_markup=kb)
+        return await cq.answer()
 
-    if data.startswith("unwhitelist_"):
-        target_id = int(data.split("_")[1])
-        await remove_whitelist(chat_id, target_id)
-        user = await client.get_users(target_id)
+    if data.startswith("unwl_"):
+        tid = int(data.split("_")[1])
+        await remove_whitelist(chat_id, tid)
+        u = await client.get_users(tid)
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Re-add", callback_data=f"whitelist_{target_id}"),
-            InlineKeyboardButton("❌ Close",  callback_data="close"),
+            InlineKeyboardButton("✅ Re-add", callback_data=f"wl_{tid}"),
+            InlineKeyboardButton("✖️ Close",  callback_data="close"),
         ]])
-        await callback_query.message.edit_text(
-            f"🚫 **{user.mention} removed from whitelist.**", reply_markup=kb
-        )
-        return await callback_query.answer()
+        await cq.message.edit_text(f"🚫 **{u.mention} removed from whitelist.**", reply_markup=kb)
+        return await cq.answer()
 
+# ── Grace Period Handler ────────────────────────────────────────────────────────
 
-# ── Core Logic ─────────────────────────────────────────────────────────────────
+@app.on_message(filters.group, group=1)
+async def grace_period_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if (message.chat.id, message.from_user.id) in _in_grace:
+        await safe_delete(message)
+
+# ── Core Violation Handler ─────────────────────────────────────────────────────
 
 async def handle_violation(client: Client, message: Message, user, chat_id: int, settings: dict, strike: int):
-    """Handle a bio violation based on the current strike count."""
     ban_days  = settings["ban_days"]
-    KICK_LIMIT = 3
+    show_warn = settings["warn_in_group"]
+
+    # Delete triggering message immediately
+    await safe_delete(message)
 
     if strike < KICK_LIMIT:
-        # ── Strike 1 or 2: warn → 3 min grace → kick ──
-        wait_mins = 3
-        warn_msg  = None
+        warn_msg = await msg_strike_warning(message, user, strike, GRACE_KICK) if show_warn else None
+        _in_grace.add((chat_id, user.id))
+        await asyncio.sleep(GRACE_KICK * 60)
+        _in_grace.discard((chat_id, user.id))
 
-        if settings["warn_in_group"]:
-            warn_msg = await send_group_warn_strike(message, user, strike, KICK_LIMIT, wait_mins)
-        if settings["warn_in_pm"]:
-            await send_pm_warn_strike(client, user, message.chat.title, strike, KICK_LIMIT, wait_mins)
+        await safe_delete(warn_msg)
 
-        await mute_user(client, chat_id, user.id)
-        await asyncio.sleep(wait_mins * 60)
+        if not await bio_has_violation(client, user.id):
+            return  # User fixed their bio — no action
 
-        # Check if the user removed the link during the grace period
-        try:
-            refreshed = await client.get_chat(user.id)
-            bio = refreshed.bio or ""
-            found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
-            all_ok = True
-            for url in found:
-                if not await is_link_allowed(url):
-                    all_ok = False
-                    break
-            if all_ok:
-                await unmute_user(client, chat_id, user.id)
-                if warn_msg:
-                    try: await warn_msg.delete()
-                    except Exception: pass
-                return
-        except Exception:
-            pass
-
-        # Link still present — delete warning, delete user messages, kick
-        if warn_msg:
-            try: await warn_msg.delete()
-            except Exception: pass
-        await delete_message_safe(message)
-        await delete_user_messages(client, chat_id, user.id)
-        await kick_user_safe(client, chat_id, user.id)
-        if settings["warn_in_pm"]:
-            await send_pm_kick_notice(client, user, message.chat.title)
+        await delete_user_history(client, chat_id, user.id)
+        await kick_user(client, chat_id, user.id)
 
     else:
-        # ── Strike 3: final warning → 5 min grace → ban ──
-        wait_mins = 5
-        warn_msg  = None
+        warn_msg = await msg_final_warning(message, user, GRACE_BAN, ban_days) if show_warn else None
+        _in_grace.add((chat_id, user.id))
+        await asyncio.sleep(GRACE_BAN * 60)
+        _in_grace.discard((chat_id, user.id))
 
-        if settings["warn_in_group"]:
-            warn_msg = await send_group_final_warning(message, user, wait_mins)
-        if settings["warn_in_pm"]:
-            await send_pm_final_warning(client, user, message.chat.title, wait_mins)
+        await safe_delete(warn_msg)
 
-        await mute_user(client, chat_id, user.id)
-        await asyncio.sleep(wait_mins * 60)
+        if not await bio_has_violation(client, user.id):
+            await reset_kicks(chat_id, user.id)
+            return  # User fixed their bio — no action
 
-        # Check if the user removed the link
-        try:
-            refreshed = await client.get_chat(user.id)
-            bio = refreshed.bio or ""
-            found = [m.group(0) for m in URL_PATTERN.finditer(bio)]
-            all_ok = True
-            for url in found:
-                if not await is_link_allowed(url):
-                    all_ok = False
-                    break
-            if all_ok:
-                await reset_kicks(chat_id, user.id)
-                await unmute_user(client, chat_id, user.id)
-                if warn_msg:
-                    try: await warn_msg.delete()
-                    except Exception: pass
-                return
-        except Exception:
-            pass
+        await delete_user_history(client, chat_id, user.id)
+        await ban_user(client, chat_id, user.id, ban_days)
 
-        # Link still present — delete warning, delete user messages, ban
-        if warn_msg:
-            try: await warn_msg.delete()
-            except Exception: pass
-        await delete_message_safe(message)
-        await delete_user_messages(client, chat_id, user.id)
-        await ban_user_safe(client, chat_id, user.id, ban_days)
-        if settings["warn_in_group"]:
-            ban_notice = await send_group_ban_notice(message, user, ban_days)
-            if ban_notice:
-                asyncio.create_task(_delete_after(ban_notice, 180))
-        if settings["warn_in_pm"]:
-            await send_pm_ban_notice(client, user, message.chat.title, ban_days)
+        if show_warn:
+            notice = await msg_ban_notice(message, user, ban_days)
+            asyncio.create_task(delete_after(notice, BAN_NOTICE_TTL))
 
+# ── Bio Scanner ─────────────────────────────────────────────────────────────────
 
-# ── Bio Scanner ──────────────────────────────────────────────────────────────────
-
-# Track ongoing operations to prevent duplicate processing
-_processing: set = set()
-
-
-@app.on_message(filters.group)
+@app.on_message(filters.group, group=0)
 async def check_bio(client: Client, message: Message):
     if not message.from_user:
         return
 
     chat_id = message.chat.id
     user_id = message.from_user.id
+    key     = (chat_id, user_id)
 
-    # Prevent processing the same user in the same group concurrently
-    key = (chat_id, user_id)
-    if key in _processing:
+    if key in _processing or key in _in_grace:
         return
-    _processing.add(key)
 
+    _processing.add(key)
     try:
         if await is_admin(client, chat_id, user_id):
             return
@@ -667,41 +460,32 @@ async def check_bio(client: Client, message: Message):
             return
 
         try:
-            user_full = await client.get_chat(user_id)
-            bio = user_full.bio or ""
+            bio = (await client.get_chat(user_id)).bio or ""
         except Exception:
             return
 
-        found_urls = [m.group(0) for m in URL_PATTERN.finditer(bio)]
-        if not found_urls:
-            return
-
-        all_allowed = True
-        for url in found_urls:
-            if not await is_link_allowed(url):
-                all_allowed = False
+        violated = False
+        for m in URL_PATTERN.finditer(bio):
+            if not await is_link_allowed(m.group(0)):
+                violated = True
                 break
-        if all_allowed:
+        if not violated:
             return
 
-        settings   = await get_chat_settings(chat_id)
-        strike     = await increment_kick(chat_id, user_id)
-        user       = message.from_user
-
-        await handle_violation(client, message, user, chat_id, settings, strike)
+        settings = await get_chat_settings(chat_id)
+        strike   = await increment_kick(chat_id, user_id)
+        await handle_violation(client, message, message.from_user, chat_id, settings, strike)
 
     finally:
         _processing.discard(key)
 
-
-# ── Bot Entry Point ──────────────────────────────────────────────────────────────
+# ── Entry Point ─────────────────────────────────────────────────────────────────
 
 async def main():
     await init_db()
     asyncio.create_task(start_cleanup_scheduler())
     await app.start()
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     app.run(main())
